@@ -94,13 +94,13 @@ We aimed to build something that:
 ##🚀 How to Run the Project
 
 1️⃣ Upload Arduino Code
-1. Open `radar.ino` in Arduino IDE
+1. Open `sketch_nov03a.ino` in Arduino IDE
 2. Select board: **Arduino UNO**
 3. Select Port (COMx)
 4. Upload
 
 2️⃣ Run Processing UI
-1. Open `radar_UI.pde` in Processing IDE
+1. Open `radar_UI` in Processing IDE
 2. Change the serial port name (`COM7`, etc.)
 3. Click Run ✅
 

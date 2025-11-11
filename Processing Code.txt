@@ -1,0 +1,390 @@
+// Final Processing Radar (merged UI: old cone look + left sidebar)
+// Logs CSV: timestamp_ms,timestamp_sec,angle,distance_cm,speed_cmps,direction,threat,date_time
+
+import processing.serial.*;
+import java.io.*;
+import java.util.ArrayList;
+
+Serial myPort;
+PrintWriter csv;
+
+// Incoming raw line
+String rawLine = "";
+
+// Latest parsed values
+int iAngle = 90;
+int iDistance = 999;
+float fSpeed = 0.0;
+String sDirection = "CENTER";
+String sThreat = "SAFE";
+int intruderCount = 0;
+
+// For drawing trails / bars
+ArrayList<PVector> history = new ArrayList<PVector>();
+ArrayList<Integer> historyAngles = new ArrayList<Integer>(); // angle per point
+ArrayList<Integer> historyDists = new ArrayList<Integer>();  // dist per point
+
+// UI layout
+int sidebarW = 220;
+int radarRadius;
+float sweepAlpha = 120;  // for cone fade
+
+void setup() {
+  size(1200, 700);
+  frameRate(60);
+  smooth();
+  background(0);
+
+  // CSV file
+  String t = year() + "-" + nf(month(),2) + "-" + nf(day(),2) + "_" + nf(hour(),2) + "-" + nf(minute(),2) + "-" + nf(second(),2);
+  String filename = "RadarLog_" + t + ".csv";
+  csv = createWriter(filename);
+  csv.println("timestamp_ms,timestamp_sec,angle,distance_cm,speed_cmps,direction,threat,date_time");
+  csv.flush();
+  println("CSV created: " + filename);
+
+  // Serial port - change COM port to your port
+  String portName = "COM7";
+  try {
+    myPort = new Serial(this, portName, 9600);
+    myPort.bufferUntil('\n');
+    println("Connected to " + portName);
+  } catch (Exception e) {
+    println("ERROR opening serial port " + portName + " -> " + e);
+    println("Available ports: ");
+    println(join(Serial.list(), "\n"));
+  }
+
+  radarRadius = min(width - sidebarW - 120, height - 120);
+}
+
+void draw() {
+  background(0);
+
+  // Left sidebar
+  drawSidebar();
+
+  // Radar area
+  pushMatrix();
+  translate(sidebarW + (width - sidebarW)/2, height - 100);
+  drawRadarGrid();
+  drawBarsAndTrail();
+  drawSweepCone();
+  popMatrix();
+
+  // Bottom info
+  drawBottomInfo();
+}
+
+// ------------------ Serial parsing ------------------
+// ------------------ Serial parsing (UPDATED for 7 fields) ------------------
+void serialEvent(Serial p) {
+  rawLine = p.readStringUntil('\n');
+  if (rawLine == null) return;
+  rawLine = rawLine.trim();
+  if (rawLine.length() == 0) return;
+
+  if (rawLine.endsWith(".")) {
+    rawLine = rawLine.substring(0, rawLine.length()-1).trim();
+  }
+
+  if (rawLine.startsWith("INTRUDER") || rawLine.startsWith("LOG")) {
+    handleIntruderLine(rawLine);
+    return;
+  }
+
+  // Split by comma
+  String[] parts = split(rawLine, ",");
+  for (int i = 0; i < parts.length; i++) parts[i] = parts[i].trim();
+
+  // ✅ NEW SUPPORT: Arduino sends 7 fields (timestamp,angle,dist,dir,speed,threat,NA)
+  if (parts.length == 7) {
+    try {
+      long ts = Long.parseLong(parts[0]);
+      int a = int(parts[1]);
+      int d = int(parts[2]);
+      String dir = parts[3];
+      float sp = parseFloatSafe(parts[4]);
+      String th = parts[5];
+
+      saveAndDisplay(ts, a, d, sp, dir, th);
+    } catch (Exception e) {
+      println("❌ ERROR parsing 7-field packet => " + rawLine);
+    }
+    return;
+  }
+
+  // ✅ Backward compatibility (older 6 field formats)
+  if (parts.length == 6) {
+    boolean parsed = false;
+
+    if (isInteger(parts[0]) && int(parts[0]) > 2000) {
+      try {
+        saveAndDisplay(
+          Long.parseLong(parts[0]),
+          int(parts[1]),
+          int(parts[2]),
+          parseFloatSafe(parts[4]),
+          parts[3],
+          parts[5]
+        );
+        parsed = true;
+      } catch(Exception e) {}
+    }
+
+    if (!parsed) {
+      try {
+        saveAndDisplay(
+          Long.parseLong(parts[4]),
+          int(parts[0]),
+          int(parts[1]),
+          parseFloatSafe(parts[2]),
+          parts[3],
+          parts[5]
+        );
+        parsed = true;
+      } catch(Exception e) {}
+    }
+
+    if (!parsed) println("❌ Unexpected packet (6 fields): " + rawLine);
+    return;
+  }
+
+  // Debug other cases
+  println("❌ Unexpected packet length (" + parts.length + ") => " + rawLine);
+}
+
+
+// Helper: handle INTRUDER lines like "INTRUDER,123,45,3" or "INTRUDER,timestamp,angle,distance"
+void handleIntruderLine(String line) {
+  String[] p = split(line, ",");
+  for (int i=0;i<p.length;i++) p[i] = p[i].trim();
+  if (p.length >= 4) {
+    // p[0] = INTRUDER
+    String tsStr = p[1];
+    String aStr = p[2];
+    String dStr = p[3];
+    int a = 0;
+    int d = 999;
+    long ts = 0;
+    try { ts = Long.parseLong(tsStr); } catch (Exception e) { ts = millis(); }
+    try { a = int(aStr); } catch (Exception e) { a = 0; }
+    try { d = int(dStr); } catch (Exception e) { d = 999; }
+
+    intruderCount++;
+    String dateTime = year()+"-"+nf(month(),2)+"-"+nf(day(),2)+" "+nf(hour(),2)+":"+nf(minute(),2)+":"+nf(second(),2);
+    float tsec = ts/1000.0;
+    csv.println(ts + "," + nf(tsec,0,3) + "," + a + "," + d + "," + "0.0" + "," + "INTRUDER" + "," + dateTime);
+    csv.flush();
+    println("INTRUDER #" + intruderCount + " logged: " + a + "° at " + d + "cm  (ts=" + ts + ")");
+  } else {
+    println("Malformed INTRUDER: " + line);
+  }
+}
+
+// Save parsed values, push to history and write CSV
+void saveAndDisplay(long timestampMs, int angle, int dist, float speed, String dir, String threat) {
+  iAngle = constrain(angle, 0, 180);
+  iDistance = (dist < 0 || dist > 999) ? 999 : dist;
+  fSpeed = (speed < 0) ? 0 : speed;
+  sDirection = dir;
+  sThreat = threat;
+
+  // Add to history for visualization (only if object detected within 40cm)
+  if (iDistance > 0 && iDistance <= 40) {
+    float px = iDistance * 10.0; // scale for display
+    // store point (x,y) scaled
+    float x = px * cos(radians(iAngle));
+    float y = -px * sin(radians(iAngle));
+    history.add(new PVector(x, y));
+    historyAngles.add(iAngle);
+    historyDists.add(iDistance);
+    if (history.size() > 400) {
+      history.remove(0);
+      historyAngles.remove(0);
+      historyDists.remove(0);
+    }
+  }
+
+  // CSV write: timestamp_ms,timestamp_sec,angle,distance_cm,speed_cmps,direction,threat,date_time
+  float tsec = timestampMs / 1000.0;
+  String dateTime = year()+"-"+nf(month(),2)+"-"+nf(day(),2)+" "+nf(hour(),2)+":"+nf(minute(),2)+":"+nf(second(),2);
+
+  csv.println(timestampMs + "," + nf(tsec,0,3) + "," + iAngle + "," + iDistance + "," + nf(fSpeed,0,2) + "," + sDirection + "," + sThreat + "," + dateTime);
+  csv.flush();
+
+  // Auto-count intruders on DANGER events (or first detection)
+  if (sThreat.equals("DANGER")) {
+    // optional increment only when first detected - we'll count if last history entry is DANGER
+    intruderCount++;
+    println("🚨 INTRUDER #" + intruderCount + " logged: " + iAngle + "° at " + iDistance + "cm  (ts=" + timestampMs + ")");
+  }
+}
+
+// ------------------ Drawing functions ------------------
+void drawSidebar() {
+  pushMatrix();
+  // Background box
+  fill(20);
+  noStroke();
+  rect(10, 10, sidebarW-20, height-20, 8);
+
+  // Title
+  fill(40,255,80);
+  textSize(20);
+  textAlign(LEFT, TOP);
+  text("Threat", 20, 20);
+
+  // Danger box
+  int boxX = 20;
+  int boxY = 60;
+  int boxW = sidebarW - 40;
+  int boxH = 70;
+
+  // DANGER
+  fill(sThreat.equals("DANGER") ? color(255,30,30) : color(60));
+  rect(boxX, boxY, boxW, 40, 6);
+  fill(200); textSize(14); text("DANGER", boxX+8, boxY+10);
+
+  // WARNING
+  fill(sThreat.equals("WARNING") ? color(255,170,30) : color(60));
+  rect(boxX, boxY+50, boxW, 40, 6);
+  fill(200); textSize(14); text("WARNING", boxX+8, boxY+60);
+
+  // SAFE
+  fill(sThreat.equals("SAFE") ? color(20,200,40) : color(60));
+  rect(boxX, boxY+100, boxW, 60, 6);
+  fill(20); textSize(14); text("SAFE", boxX+8, boxY+120);
+
+  // CSV status
+  fill(200);
+  textSize(12);
+  text("CSV: logging", 20, boxY+180);
+  text("Intruders: " + intruderCount, 20, boxY+200);
+
+  popMatrix();
+}
+
+void drawRadarGrid() {
+  int rbig = radarRadius/2;
+  stroke(40,200,40);
+  strokeWeight(2);
+  noFill();
+
+  // arcs
+  for (int i=0;i<4;i++) {
+    int rad = int(map(i,0,3, rbig/4, rbig));
+    arc(0,0, rad*2, rad*2, PI, TWO_PI);
+  }
+  // lines and angles
+  strokeWeight(2);
+  for (int a=0;a<=180;a+=30) {
+    float x = (rbig) * cos(radians(a));
+    float y = -(rbig) * sin(radians(a));
+    line(0,0,x,y);
+  }
+  // angle numbers
+  fill(40,255,80); textSize(18);
+  textAlign(CENTER, CENTER);
+  text("90°", 0, -rbig-20);
+  text("30°", (rbig)*cos(radians(30)), -(rbig)*sin(radians(30))-20);
+  text("150°", (rbig)*cos(radians(150)), -(rbig)*sin(radians(150))-20);
+
+  // bottom ticks 10/20/30/40
+  textSize(14);
+  text("10cm", rbig*0.25, 10);
+  text("20cm", rbig*0.5, 10);
+  text("30cm", rbig*0.75, 10);
+  text("40cm", rbig*1.0, 10);
+}
+
+void drawBarsAndTrail() {
+  pushMatrix();
+  // Draw historical bars (red) with slight transparency
+  for (int i=0; i<history.size(); i++) {
+    int ha = historyAngles.get(i);
+    int hd = historyDists.get(i);
+    float px = hd * 10.0; // same scale
+    float x1 = px * cos(radians(ha));
+    float y1 = -px * sin(radians(ha));
+    stroke(200,40,40, 120);
+    strokeWeight(6);
+    line( x1*0.9, y1*0.9, x1, y1 );
+  }
+
+  // Draw history dots/green tail for most recent chunk
+  int n = history.size();
+  for (int i=max(0, n-30); i<n; i++) {
+    PVector p = history.get(i);
+    noStroke();
+    fill(0,255,100, 160);
+    ellipse(p.x, p.y, 8, 8);
+  }
+
+  popMatrix();
+}
+
+void drawSweepCone() {
+  pushMatrix();
+  // Cone fill (slightly translucent)
+  noStroke();
+  float coneR = radarRadius/2.0;
+  fill(0,255,120, 30);
+  beginShape();
+  vertex(0,0);
+  float leftA = iAngle - 3;
+  float rightA = iAngle + 3;
+  for (float a = leftA; a <= rightA; a += 0.5) {
+    float x = coneR * cos(radians(a));
+    float y = -coneR * sin(radians(a));
+    vertex(x,y);
+  }
+  endShape(CLOSE);
+
+  // Sweep line
+  stroke(50,255,60);
+  strokeWeight(6);
+  line(0,0, coneR * cos(radians(iAngle)), -coneR * sin(radians(iAngle)));
+
+  popMatrix();
+}
+
+void drawBottomInfo() {
+  pushStyle();
+  fill(98,245,31);
+  textAlign(CENTER, BOTTOM);
+  textSize(28);
+
+  String line = "Angle: " + iAngle + "°   Distance: " + (iDistance<=40 && iDistance>0 ? iDistance + "cm" : "---") +
+                "   Direction: " + sDirection + "   Speed: " + nf(fSpeed,0,1) + " cm/s   Threat: " + sThreat;
+
+  text(line, sidebarW + (width - sidebarW)/2, height - 10);
+  popStyle();
+}
+
+// ------------------ Utilities ------------------
+boolean isInteger(String s) {
+  try {
+    Integer.parseInt(s);
+    return true;
+  } catch (Exception e) {
+    return false;
+  }
+}
+
+float parseFloatSafe(String s) {
+  try {
+    return Float.parseFloat(s);
+  } catch (Exception e) {
+    return 0.0;
+  }
+}
+
+void exit() {
+  if (csv != null) {
+    csv.flush();
+    csv.close();
+    println("CSV saved. Intruders: " + intruderCount);
+  }
+  super.exit();
+}
